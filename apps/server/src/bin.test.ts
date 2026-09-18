@@ -10,7 +10,9 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   CommandId,
   EnvironmentOrchestrationHttpApi,
+  ProviderDriverKind,
   ProviderInstanceId,
+  type ServerProvider,
   ThreadId,
 } from "@t3tools/contracts";
 import * as NetService from "@t3tools/shared/Net";
@@ -19,6 +21,8 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
 import * as Layer from "effect/Layer";
+import * as Stdio from "effect/Stdio";
+import * as Stream from "effect/Stream";
 import * as HttpRouter from "effect/unstable/http/HttpRouter";
 import * as HttpServer from "effect/unstable/http/HttpServer";
 import * as HttpApi from "effect/unstable/httpapi/HttpApi";
@@ -41,6 +45,7 @@ import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
 import { orchestrationHttpApiLayer } from "./orchestration/http.ts";
 import * as ProjectCloneTracker from "./project/ProjectCloneTracker.ts";
 import { layerConfig as SqlitePersistenceLayerLive } from "./persistence/Layers/Sqlite.ts";
+import { writeProviderStatusCache } from "./provider/providerStatusCache.ts";
 import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
 import {
   makePersistedServerRuntimeState,
@@ -863,5 +868,206 @@ it.layer(NodeServices.layer)("bin cli parsing", (it) => {
       }
       assert.equal(optionError.option, "--dev-url");
     }),
+  );
+});
+
+const makeCachedProvider = (
+  instanceId: string,
+  models: ReadonlyArray<{ readonly slug: string; readonly isDefault?: boolean }>,
+): ServerProvider => ({
+  instanceId: ProviderInstanceId.make(instanceId),
+  driver: ProviderDriverKind.make(instanceId),
+  enabled: true,
+  installed: true,
+  version: null,
+  status: "ready",
+  auth: { status: "authenticated" },
+  checkedAt: "2026-09-18T00:00:00.000Z",
+  models: models.map((model) => ({
+    slug: model.slug,
+    name: model.slug,
+    isCustom: false,
+    capabilities: null,
+    ...(model.isDefault ? { isDefault: true } : {}),
+  })),
+  slashCommands: [],
+  skills: [],
+});
+
+const withThreadStartFixture = <A, E, R>(
+  run: (input: {
+    readonly baseDir: string;
+    readonly workspaceRoot: string;
+  }) => Effect.Effect<A, E, R>,
+) =>
+  Effect.gen(function* () {
+    const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-cli-thread-state-"));
+    const workspaceRoot = NodeFS.mkdtempSync(
+      NodePath.join(NodeOS.tmpdir(), "t3-cli-thread-workspace-"),
+    );
+    yield* runCliWithRuntime(["project", "add", workspaceRoot, "--base-dir", baseDir]);
+    const project = (yield* readPersistedSnapshot(baseDir)).projects.find(
+      (candidate) => candidate.workspaceRoot === workspaceRoot,
+    );
+    assert.isDefined(project);
+    const config = yield* makeCliTestServerConfig(baseDir);
+    yield* writeProviderStatusCache({
+      filePath: NodePath.join(config.providerStatusCacheDir, "claudeAgent.json"),
+      provider: makeCachedProvider("claudeAgent", [
+        { slug: "claude-fable-5-1", isDefault: true },
+        { slug: "claude-opus-5" },
+      ]),
+    });
+    yield* writeProviderStatusCache({
+      filePath: NodePath.join(config.providerStatusCacheDir, "codex.json"),
+      provider: makeCachedProvider("codex", [{ slug: "gpt-5.6-sol", isDefault: true }]),
+    });
+    NodeFS.writeFileSync(
+      config.settingsPath,
+      `{
+        "defaultRuntimeMode": "approval-required",
+        "defaultModelSelection": { "instanceId": "claudeAgent", "model": "claude-fable-5-1" },
+        "projectSettingsFolded": true,
+        "projectSettingsOverrides": {
+          "${project!.id}": {
+            "defaultModelSelection": { "instanceId": "claudeAgent", "model": "claude-opus-5" }
+          }
+        }
+      }`,
+    );
+    return yield* withLiveProjectCliServer(baseDir, () => run({ baseDir, workspaceRoot }));
+  });
+
+const readProjectThreads = (workspaceRoot: string) =>
+  Effect.gen(function* () {
+    const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+    const snapshot = yield* projectionSnapshotQuery.getSnapshot();
+    const project = snapshot.projects.find(
+      (candidate) => candidate.workspaceRoot === workspaceRoot,
+    );
+    return snapshot.threads.filter((thread) => thread.projectId === project?.id);
+  });
+
+it.layer(NodeServices.layer)("thread start", (it) => {
+  it.effect("starts a thread with the prompt on the provider that offers the model", () =>
+    withThreadStartFixture(({ baseDir, workspaceRoot }) =>
+      Effect.gen(function* () {
+        const { output } = yield* captureStdout(
+          runCli([
+            "thread",
+            "start",
+            workspaceRoot,
+            "Fix the flaky test",
+            "--model",
+            "claude-fable-5-1",
+            "--json",
+            "--base-dir",
+            baseDir,
+          ]),
+        );
+
+        const [thread, ...others] = yield* readProjectThreads(workspaceRoot);
+        assert.isDefined(thread);
+        assert.lengthOf(others, 0);
+        assert.deepEqual(thread!.modelSelection, {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          model: "claude-fable-5-1",
+        });
+        assert.equal(thread!.runtimeMode, "approval-required");
+        assert.equal(thread!.title, "Fix the flaky test");
+        assert.deepEqual(
+          thread!.messages.map((message) => [message.role, message.text]),
+          [["user", "Fix the flaky test"]],
+        );
+        assert.include(output, `"threadId":"${thread!.id}"`);
+      }),
+    ),
+  );
+
+  it.effect("reads the prompt from stdin and uses the project default model", () =>
+    withThreadStartFixture(({ baseDir, workspaceRoot }) =>
+      Effect.gen(function* () {
+        yield* runCli([
+          "thread",
+          "start",
+          workspaceRoot,
+          "-",
+          "--title",
+          "Release prep",
+          "--base-dir",
+          baseDir,
+        ]).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              CliRuntimeLayer,
+              Stdio.layerTest({
+                stdin: Stream.make(new TextEncoder().encode("Review the diff\nthen ship it\n")),
+              }),
+            ),
+          ),
+        );
+
+        const [thread] = yield* readProjectThreads(workspaceRoot);
+        assert.isDefined(thread);
+        assert.deepEqual(thread!.modelSelection, {
+          instanceId: ProviderInstanceId.make("claudeAgent"),
+          model: "claude-opus-5",
+        });
+        assert.equal(thread!.title, "Release prep");
+        assert.equal(thread!.messages[0]?.text, "Review the diff\nthen ship it");
+      }),
+    ),
+  );
+
+  it.effect("uses the provider default model when only a provider is given", () =>
+    withThreadStartFixture(({ baseDir, workspaceRoot }) =>
+      Effect.gen(function* () {
+        yield* runCliWithRuntime([
+          "thread",
+          "start",
+          workspaceRoot,
+          "Fix the flaky test",
+          "--provider",
+          "codex",
+          "--base-dir",
+          baseDir,
+        ]);
+
+        const [thread] = yield* readProjectThreads(workspaceRoot);
+        assert.deepEqual(thread?.modelSelection, {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5.6-sol",
+        });
+      }),
+    ),
+  );
+
+  it.effect("rejects unknown models and providers and lists the available ones", () =>
+    withThreadStartFixture(({ baseDir, workspaceRoot }) =>
+      Effect.gen(function* () {
+        const start = (flag: string, value: string) =>
+          runCliWithRuntime([
+            "thread",
+            "start",
+            workspaceRoot,
+            "Fix the flaky test",
+            flag,
+            value,
+            "--base-dir",
+            baseDir,
+          ]).pipe(Effect.flip);
+
+        const modelError = yield* start("--model", "claude-opus-9");
+        assert.include(modelError.message, "Model 'claude-opus-9' not found.");
+        assert.include(modelError.message, "claudeAgent/claude-opus-5");
+
+        const providerError = yield* start("--provider", "claude");
+        assert.equal(
+          providerError.message,
+          "Provider 'claude' not found. Available: claudeAgent, codex.",
+        );
+        assert.lengthOf(yield* readProjectThreads(workspaceRoot), 0);
+      }),
+    ),
   );
 });
