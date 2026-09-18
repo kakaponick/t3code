@@ -415,17 +415,19 @@ const runThreadStart = Effect.fn("runThreadStart")(function* (flags: {
         createdAt,
       })
       .pipe(
-        Effect.tapError(() =>
-          threadCommandUuid.pipe(
-            Effect.flatMap((commandId) =>
-              server.dispatch({
-                type: "thread.delete",
-                commandId: CommandId.make(commandId),
-                threadId,
-              }),
-            ),
-            Effect.ignore({ log: true }),
-          ),
+        Effect.tapError((error) =>
+          error._tag === "ProjectLiveServerDeclaredResponseError"
+            ? threadCommandUuid.pipe(
+                Effect.flatMap((commandId) =>
+                  server.dispatch({
+                    type: "thread.delete",
+                    commandId: CommandId.make(commandId),
+                    threadId,
+                  }),
+                ),
+                Effect.ignore({ log: true }),
+              )
+            : Effect.void,
         ),
       );
 

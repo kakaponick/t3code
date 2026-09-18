@@ -21,6 +21,8 @@ import { HostProcessEnvironment } from "@t3tools/shared/hostProcess";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Stdio from "effect/Stdio";
 import * as Stream from "effect/Stream";
@@ -29,6 +31,7 @@ import * as HttpServer from "effect/unstable/http/HttpServer";
 import * as HttpApi from "effect/unstable/httpapi/HttpApi";
 import * as HttpApiBuilder from "effect/unstable/httpapi/HttpApiBuilder";
 import * as CliError from "effect/unstable/cli/CliError";
+import * as TestClock from "effect/testing/TestClock";
 import * as TestConsole from "effect/testing/TestConsole";
 import { Command } from "effect/unstable/cli";
 
@@ -43,6 +46,7 @@ import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import { OrchestrationLayerLive } from "./orchestration/runtimeLayer.ts";
+import { OrchestrationCommandInvariantError } from "./orchestration/Errors.ts";
 import { orchestrationHttpApiLayer } from "./orchestration/http.ts";
 import * as ProjectCloneTracker from "./project/ProjectCloneTracker.ts";
 import { layerConfig as SqlitePersistenceLayerLive } from "./persistence/Layers/Sqlite.ts";
@@ -366,9 +370,25 @@ it.layer(NodeServices.layer)("project lookup with unavailable workspaces", (it) 
   );
 });
 
-const withLiveProjectCliServer = <A, E, R>(baseDir: string, run: () => Effect.Effect<A, E, R>) =>
+type EngineDispatch = OrchestrationEngine.OrchestrationEngineService["Service"]["dispatch"];
+
+const withLiveProjectCliServer = <A, E, R>(
+  baseDir: string,
+  run: () => Effect.Effect<A, E, R>,
+  wrapDispatch?: (dispatch: EngineDispatch) => EngineDispatch,
+) =>
   Effect.gen(function* () {
     const config = yield* makeCliTestServerConfig(baseDir);
+    const dispatchOverrideLayer =
+      wrapDispatch === undefined
+        ? Layer.empty
+        : Layer.effect(
+            OrchestrationEngine.OrchestrationEngineService,
+            Effect.map(OrchestrationEngine.OrchestrationEngineService, (engine) => ({
+              ...engine,
+              dispatch: wrapDispatch(engine.dispatch),
+            })),
+          );
     const routesLayer = HttpApiBuilder.layer(ProjectCliHttpApi).pipe(
       Layer.provide(
         orchestrationHttpApiLayer.pipe(
@@ -378,6 +398,7 @@ const withLiveProjectCliServer = <A, E, R>(baseDir: string, run: () => Effect.Ef
               discard: () => Effect.void,
             }),
           ),
+          Layer.provide(dispatchOverrideLayer),
         ),
       ),
       Layer.provide(environmentAuthenticatedAuthLayer),
@@ -900,6 +921,7 @@ const withThreadStartFixture = <A, E, R>(
     readonly baseDir: string;
     readonly workspaceRoot: string;
   }) => Effect.Effect<A, E, R>,
+  wrapDispatch?: (dispatch: EngineDispatch) => EngineDispatch,
 ) =>
   Effect.gen(function* () {
     const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-cli-thread-state-"));
@@ -936,7 +958,11 @@ const withThreadStartFixture = <A, E, R>(
         }
       }`,
     );
-    return yield* withLiveProjectCliServer(baseDir, () => run({ baseDir, workspaceRoot }));
+    return yield* withLiveProjectCliServer(
+      baseDir,
+      () => run({ baseDir, workspaceRoot }),
+      wrapDispatch,
+    );
   });
 
 const readProjectThreads = (workspaceRoot: string) =>
@@ -1163,5 +1189,68 @@ it.layer(NodeServices.layer)("thread send", (it) => {
         assert.lengthOf(thread!.messages, 1);
       }),
     ),
+  );
+});
+
+it.layer(NodeServices.layer)("thread start rollback", (it) => {
+  const startArgs = (baseDir: string, workspaceRoot: string) => [
+    "thread",
+    "start",
+    workspaceRoot,
+    "Fix the flaky test",
+    "--base-dir",
+    baseDir,
+  ];
+
+  it.effect("deletes the new thread when the server rejects the turn", () =>
+    withThreadStartFixture(
+      ({ baseDir, workspaceRoot }) =>
+        Effect.gen(function* () {
+          yield* runCliWithRuntime(startArgs(baseDir, workspaceRoot)).pipe(Effect.flip);
+
+          const threads = yield* readProjectThreads(workspaceRoot);
+          assert.lengthOf(
+            threads.filter((thread) => thread.deletedAt === null),
+            0,
+          );
+        }),
+      (dispatch) => (command, options) =>
+        command.type === "thread.turn.start"
+          ? Effect.fail(
+              new OrchestrationCommandInvariantError({
+                commandType: command.type,
+                detail: "Rejected by test.",
+              }),
+            )
+          : dispatch(command, options),
+    ),
+  );
+
+  it.effect("keeps the thread when the turn outcome is unknown", () =>
+    Effect.gen(function* () {
+      const turnAccepted = yield* Deferred.make<void>();
+      yield* withThreadStartFixture(
+        ({ baseDir, workspaceRoot }) =>
+          Effect.gen(function* () {
+            const starting = yield* Effect.forkChild(
+              runCliWithRuntime(startArgs(baseDir, workspaceRoot)).pipe(Effect.flip),
+            );
+            yield* Deferred.await(turnAccepted);
+            yield* TestClock.adjust("10 seconds");
+            yield* Fiber.join(starting);
+
+            const [thread] = yield* readProjectThreads(workspaceRoot);
+            assert.isNull(thread?.deletedAt);
+            assert.equal(thread?.messages[0]?.text, "Fix the flaky test");
+          }),
+        (dispatch) => (command, options) =>
+          command.type === "thread.turn.start"
+            ? dispatch(command, options).pipe(
+                Effect.tap(() => Deferred.succeed(turnAccepted, undefined)),
+                Effect.andThen(Effect.never),
+              )
+            : dispatch(command, options),
+      );
+    }),
   );
 });
