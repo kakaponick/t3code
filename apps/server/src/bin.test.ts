@@ -1145,6 +1145,55 @@ it.layer(NodeServices.layer)("thread send", (it) => {
     ),
   );
 
+  it.effect("sends right away with --now while the agent is working", () =>
+    withThreadStartFixture(({ baseDir, workspaceRoot }) =>
+      Effect.gen(function* () {
+        yield* runCliWithRuntime([
+          "thread",
+          "start",
+          workspaceRoot,
+          "Fix the flaky test",
+          "--base-dir",
+          baseDir,
+        ]);
+        const [created] = yield* readProjectThreads(workspaceRoot);
+        const engine = yield* OrchestrationEngine.OrchestrationEngineService;
+        const now = DateTime.formatIso(yield* DateTime.now);
+        yield* engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-cli-send-now-running"),
+          threadId: created!.id,
+          session: {
+            threadId: created!.id,
+            status: "running",
+            providerName: "claudeAgent",
+            runtimeMode: created!.runtimeMode,
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+          createdAt: now,
+        });
+
+        yield* runCliWithRuntime([
+          "thread",
+          "send",
+          created!.id,
+          "Change of plan",
+          "--now",
+          "--base-dir",
+          baseDir,
+        ]);
+
+        const [thread] = yield* readProjectThreads(workspaceRoot);
+        assert.include(
+          thread!.messages.map((message) => message.text),
+          "Change of plan",
+        );
+      }),
+    ),
+  );
+
   it.effect("refuses threads awaiting approval and unknown threads", () =>
     withThreadStartFixture(({ baseDir, workspaceRoot }) =>
       Effect.gen(function* () {

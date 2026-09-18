@@ -448,6 +448,7 @@ const runThreadSend = Effect.fn("runThreadSend")(function* (flags: {
   readonly baseDir: Option.Option<string>;
   readonly thread: string;
   readonly prompt: string;
+  readonly now: boolean;
   readonly json: boolean;
 }) {
   const config = yield* resolveCliAuthConfig(flags, yield* GlobalFlag.LogLevel);
@@ -456,11 +457,10 @@ const runThreadSend = Effect.fn("runThreadSend")(function* (flags: {
   return yield* Effect.gen(function* () {
     const server = yield* connectLiveServer(config, Duration.hours(24));
     const threadId = flags.thread.trim();
-    const thread = yield* waitForIdleThread(
-      server.shell.pipe(
-        Effect.map((shell) => shell.threads.find((candidate) => candidate.id === threadId)),
-      ),
+    const readThread = server.shell.pipe(
+      Effect.map((shell) => shell.threads.find((candidate) => candidate.id === threadId)),
     );
+    const thread = flags.now ? yield* readThread : yield* waitForIdleThread(readThread);
     if (thread === undefined) {
       return yield* new ThreadNotFoundError({ threadId });
     }
@@ -521,6 +521,10 @@ const threadSendCommand = Command.make("send", {
   ...projectLocationFlags,
   thread: Argument.String("thread").pipe(Argument.withDescription("Thread id.")),
   prompt: promptArgument,
+  now: Flag.Boolean("now").pipe(
+    Flag.withDescription("Send now. Steers running turn."),
+    Flag.withDefault(false),
+  ),
   json: jsonFlag,
 }).pipe(
   Command.withDescription("Send prompt to thread. Waits for running turn to finish."),
