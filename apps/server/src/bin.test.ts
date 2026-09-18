@@ -10,6 +10,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   CommandId,
   EnvironmentOrchestrationHttpApi,
+  EventId,
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerProvider,
@@ -1067,6 +1068,99 @@ it.layer(NodeServices.layer)("thread start", (it) => {
           "Provider 'claude' not found. Available: claudeAgent, codex.",
         );
         assert.lengthOf(yield* readProjectThreads(workspaceRoot), 0);
+      }),
+    ),
+  );
+});
+
+it.layer(NodeServices.layer)("thread send", (it) => {
+  it.effect("sends a prompt to an existing thread and keeps its modes", () =>
+    withThreadStartFixture(({ baseDir, workspaceRoot }) =>
+      Effect.gen(function* () {
+        yield* runCliWithRuntime([
+          "thread",
+          "start",
+          workspaceRoot,
+          "Fix the flaky test",
+          "--base-dir",
+          baseDir,
+        ]);
+        const [created] = yield* readProjectThreads(workspaceRoot);
+        const engine = yield* OrchestrationEngine.OrchestrationEngineService;
+        yield* engine.dispatch({
+          type: "thread.runtime-mode.set",
+          commandId: CommandId.make("cmd-cli-send-runtime-mode"),
+          threadId: created!.id,
+          runtimeMode: "auto-accept-edits",
+          createdAt: DateTime.formatIso(yield* DateTime.now),
+        });
+
+        const { output } = yield* captureStdout(
+          runCli([
+            "thread",
+            "send",
+            created!.id,
+            "Now add a regression test",
+            "--json",
+            "--base-dir",
+            baseDir,
+          ]),
+        );
+
+        const [thread] = yield* readProjectThreads(workspaceRoot);
+        assert.equal(thread!.runtimeMode, "auto-accept-edits");
+        assert.deepEqual(thread!.modelSelection, created!.modelSelection);
+        assert.sameMembers(
+          thread!.messages.map((message) => message.text),
+          ["Fix the flaky test", "Now add a regression test"],
+        );
+        assert.include(output, `"threadId":"${created!.id}"`);
+      }),
+    ),
+  );
+
+  it.effect("refuses threads awaiting approval and unknown threads", () =>
+    withThreadStartFixture(({ baseDir, workspaceRoot }) =>
+      Effect.gen(function* () {
+        yield* runCliWithRuntime([
+          "thread",
+          "start",
+          workspaceRoot,
+          "Fix the flaky test",
+          "--base-dir",
+          baseDir,
+        ]);
+        const [created] = yield* readProjectThreads(workspaceRoot);
+        const engine = yield* OrchestrationEngine.OrchestrationEngineService;
+        const now = DateTime.formatIso(yield* DateTime.now);
+        yield* engine.dispatch({
+          type: "thread.activity.append",
+          commandId: CommandId.make("cmd-cli-send-approval"),
+          threadId: created!.id,
+          activity: {
+            id: EventId.make("activity-cli-send-approval"),
+            tone: "approval",
+            kind: "approval.requested",
+            summary: "Run command",
+            payload: { requestId: "req-cli-send" },
+            turnId: null,
+            createdAt: now,
+          },
+          createdAt: now,
+        });
+
+        const send = (threadId: string) =>
+          runCliWithRuntime(["thread", "send", threadId, "Keep going", "--base-dir", baseDir]).pipe(
+            Effect.flip,
+          );
+
+        assert.equal(
+          (yield* send(created!.id)).message,
+          "Thread awaits approval or answer. Resolve in T3 Code.",
+        );
+        assert.equal((yield* send("thread-missing")).message, "Thread 'thread-missing' not found.");
+        const [thread] = yield* readProjectThreads(workspaceRoot);
+        assert.lengthOf(thread!.messages, 1);
       }),
     ),
   );
